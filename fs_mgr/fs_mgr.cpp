@@ -1502,7 +1502,7 @@ MountAllResult fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
                 if (status == FS_MGR_MNTALL_DEV_NEEDS_METADATA_ENCRYPTION) {
                     if (!call_vdc({"cryptfs", "encryptFstab", attempted_entry.blk_device,
                                    attempted_entry.mount_point, wiped ? "true" : "false",
-                                   attempted_entry.fs_type},
+                                   attempted_entry.fs_type, attempted_entry.zoned_device},
                                   nullptr)) {
                         LERROR << "Encryption failed";
                         set_type_property(encryptable);
@@ -1542,7 +1542,7 @@ MountAllResult fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
 
                 if (!call_vdc({"cryptfs", "encryptFstab", current_entry.blk_device,
                                current_entry.mount_point, "true" /* shouldFormat */,
-                               current_entry.fs_type},
+                               current_entry.fs_type, current_entry.zoned_device},
                               nullptr)) {
                     LERROR << "Encryption failed";
                 } else {
@@ -1567,7 +1567,7 @@ MountAllResult fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
         if (mount_errno != EBUSY && mount_errno != EACCES &&
             should_use_metadata_encryption(attempted_entry)) {
             if (!call_vdc({"cryptfs", "mountFstab", attempted_entry.blk_device,
-                           attempted_entry.mount_point},
+                           attempted_entry.mount_point, attempted_entry.zoned_device},
                           nullptr)) {
                 PERROR << android::base::StringPrintf(
                     "Failure while mounting metadata, setting flag to needing recovery "
