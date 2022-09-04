@@ -61,7 +61,7 @@
 #include <libavb/libavb.h>
 #include <libgsi/libgsi.h>
 #include <libsnapshot/snapshot.h>
-#include <private/android_filesystem_config.h>
+#include <logwrap/logwrap.h>
 #include <processgroup/processgroup.h>
 #include <processgroup/setup.h>
 #include <selinux/android.h>
@@ -460,6 +460,45 @@ static Result<void> DoControlRestart(Service* service) {
     return {};
 }
 
+static Result<void> DoUnloadApex(const std::string& apex_name) {
+    std::string prop_name = "init.apex." + apex_name;
+    // TODO(b/232114573) remove services and actions read from the apex
+    // TODO(b/232799709) kill services from the apex
+    SetProperty(prop_name, "unloaded");
+    return {};
+}
+
+static Result<void> UpdateApexLinkerConfig(const std::string& apex_name) {
+    // Do not invoke linkerconfig when there's no bin/ in the apex.
+    const std::string bin_path = "/apex/" + apex_name + "/bin";
+    if (access(bin_path.c_str(), R_OK) != 0) {
+        return {};
+    }
+    const char* linkerconfig_binary = "/apex/com.android.runtime/bin/linkerconfig";
+    const char* linkerconfig_target = "/linkerconfig";
+    const char* arguments[] = {linkerconfig_binary, "--target", linkerconfig_target, "--apex",
+                               apex_name.c_str(),   "--strict"};
+
+    if (logwrap_fork_execvp(arraysize(arguments), arguments, nullptr, false, LOG_KLOG, false,
+                            nullptr) != 0) {
+        return ErrnoError() << "failed to execute linkerconfig";
+    }
+    LOG(INFO) << "Generated linker configuration for " << apex_name;
+    return {};
+}
+
+static Result<void> DoLoadApex(const std::string& apex_name) {
+    std::string prop_name = "init.apex." + apex_name;
+    // TODO(b/232799709) read .rc files from the apex
+
+    if (auto result = UpdateApexLinkerConfig(apex_name); !result.ok()) {
+        return result.error();
+    }
+
+    SetProperty(prop_name, "loaded");
+    return {};
+}
+
 enum class ControlTarget {
     SERVICE,    // function gets called for the named service
     INTERFACE,  // action gets called for every service that holds this interface
@@ -483,6 +522,17 @@ static const std::map<std::string, ControlMessageFunction, std::less<>>& GetCont
     return control_message_functions;
 }
 
+static Result<void> HandleApexControlMessage(std::string_view action, const std::string& name,
+                                             std::string_view message) {
+    if (action == "load") {
+        return DoLoadApex(name);
+    } else if (action == "unload") {
+        return DoUnloadApex(name);
+    } else {
+        return Error() << "Unknown control msg '" << message << "'";
+    }
+}
+
 static bool HandleControlMessage(std::string_view message, const std::string& name,
                                  pid_t from_pid) {
     std::string cmdline_path = StringPrintf("proc/%d/cmdline", from_pid);
@@ -494,8 +544,20 @@ static bool HandleControlMessage(std::string_view message, const std::string& na
         process_cmdline = "unknown process";
     }
 
-    Service* service = nullptr;
     auto action = message;
+    if (ConsumePrefix(&action, "apex_")) {
+        if (auto result = HandleApexControlMessage(action, name, message); !result.ok()) {
+            LOG(ERROR) << "Control message: Could not ctl." << message << " for '" << name
+                       << "' from pid: " << from_pid << " (" << process_cmdline
+                       << "): " << result.error();
+            return false;
+        }
+        LOG(INFO) << "Control message: Processed ctl." << message << " for '" << name
+                  << "' from pid: " << from_pid << " (" << process_cmdline << ")";
+        return true;
+    }
+
+    Service* service = nullptr;
     if (ConsumePrefix(&action, "interface_")) {
         service = ServiceList::GetInstance().FindInterface(name);
     } else {
