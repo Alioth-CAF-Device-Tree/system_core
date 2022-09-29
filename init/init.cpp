@@ -51,7 +51,6 @@
 #include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
-#include <backtrace/Backtrace.h>
 #include <fs_avb/fs_avb.h>
 #include <fs_mgr.h>
 #include <fs_mgr_dm_linear.h>
@@ -62,10 +61,11 @@
 #include <libavb/libavb.h>
 #include <libgsi/libgsi.h>
 #include <libsnapshot/snapshot.h>
-#include <private/android_filesystem_config.h>
+#include <logwrap/logwrap.h>
 #include <processgroup/processgroup.h>
 #include <processgroup/setup.h>
 #include <selinux/android.h>
+#include <unwindstack/AndroidUnwinder.h>
 
 #include "action_parser.h"
 #include "builtins.h"
@@ -92,6 +92,10 @@
 #include "subcontext.h"
 #include "system/core/init/property_service.pb.h"
 #include "util.h"
+
+#ifndef RECOVERY
+#include "com_android_apex.h"
+#endif  // RECOVERY
 
 using namespace std::chrono_literals;
 using namespace std::string_literals;
@@ -271,12 +275,14 @@ static class ShutdownState {
 } shutdown_state;
 
 static void UnwindMainThreadStack() {
-    std::unique_ptr<Backtrace> backtrace(Backtrace::Create(BACKTRACE_CURRENT_PROCESS, 1));
-    if (!backtrace->Unwind(0)) {
-        LOG(ERROR) << __FUNCTION__ << "sys.powerctl: Failed to unwind callstack.";
+    unwindstack::AndroidLocalUnwinder unwinder;
+    unwindstack::AndroidUnwinderData data;
+    if (!unwinder.Unwind(data)) {
+        LOG(ERROR) << __FUNCTION__
+                   << "sys.powerctl: Failed to unwind callstack: " << data.GetErrorString();
     }
-    for (size_t i = 0; i < backtrace->NumFrames(); i++) {
-        LOG(ERROR) << "sys.powerctl: " << backtrace->FormatFrameData(i);
+    for (const auto& frame : data.frames) {
+        LOG(ERROR) << "sys.powerctl: " << unwinder.FormatFrame(frame);
     }
 }
 
@@ -309,13 +315,59 @@ Parser CreateParser(ActionManager& action_manager, ServiceList& service_list) {
     return parser;
 }
 
-// parser that only accepts new services
-Parser CreateServiceOnlyParser(ServiceList& service_list, bool from_apex) {
-    Parser parser;
+#ifndef RECOVERY
+template <typename T>
+struct LibXmlErrorHandler {
+    T handler_;
+    template <typename Handler>
+    LibXmlErrorHandler(Handler&& handler) : handler_(std::move(handler)) {
+        xmlSetGenericErrorFunc(nullptr, &ErrorHandler);
+    }
+    ~LibXmlErrorHandler() { xmlSetGenericErrorFunc(nullptr, nullptr); }
+    static void ErrorHandler(void*, const char* msg, ...) {
+        va_list args;
+        va_start(args, msg);
+        char* formatted;
+        if (vasprintf(&formatted, msg, args) >= 0) {
+            LOG(ERROR) << formatted;
+        }
+        free(formatted);
+        va_end(args);
+    }
+};
 
-    parser.AddSectionParser(
-            "service", std::make_unique<ServiceParser>(&service_list, GetSubcontext(), std::nullopt,
-                                                       from_apex));
+template <typename Handler>
+LibXmlErrorHandler(Handler&&) -> LibXmlErrorHandler<Handler>;
+#endif  // RECOVERY
+
+// Returns a Parser that accepts scripts from APEX modules. It supports `service` and `on`.
+Parser CreateApexConfigParser(ActionManager& action_manager, ServiceList& service_list) {
+    Parser parser;
+    auto subcontext = GetSubcontext();
+#ifndef RECOVERY
+    if (subcontext) {
+        const auto apex_info_list_file = "/apex/apex-info-list.xml";
+        auto error_handler = LibXmlErrorHandler([&](const auto& error_message) {
+            LOG(ERROR) << "Failed to read " << apex_info_list_file << ":" << error_message;
+        });
+        const auto apex_info_list = com::android::apex::readApexInfoList(apex_info_list_file);
+        if (apex_info_list.has_value()) {
+            std::vector<std::string> subcontext_apexes;
+            for (const auto& info : apex_info_list->getApexInfo()) {
+                if (info.hasPreinstalledModulePath() &&
+                    subcontext->PathMatchesSubcontext(info.getPreinstalledModulePath())) {
+                    subcontext_apexes.push_back(info.getModuleName());
+                }
+            }
+            subcontext->SetApexList(std::move(subcontext_apexes));
+        }
+    }
+#endif  // RECOVERY
+    parser.AddSectionParser("service",
+                            std::make_unique<ServiceParser>(&service_list, subcontext, std::nullopt,
+                                                            /*from_apex=*/true));
+    parser.AddSectionParser("on", std::make_unique<ActionParser>(&action_manager, subcontext));
+
     return parser;
 }
 
@@ -408,6 +460,45 @@ static Result<void> DoControlRestart(Service* service) {
     return {};
 }
 
+static Result<void> DoUnloadApex(const std::string& apex_name) {
+    std::string prop_name = "init.apex." + apex_name;
+    // TODO(b/232114573) remove services and actions read from the apex
+    // TODO(b/232799709) kill services from the apex
+    SetProperty(prop_name, "unloaded");
+    return {};
+}
+
+static Result<void> UpdateApexLinkerConfig(const std::string& apex_name) {
+    // Do not invoke linkerconfig when there's no bin/ in the apex.
+    const std::string bin_path = "/apex/" + apex_name + "/bin";
+    if (access(bin_path.c_str(), R_OK) != 0) {
+        return {};
+    }
+    const char* linkerconfig_binary = "/apex/com.android.runtime/bin/linkerconfig";
+    const char* linkerconfig_target = "/linkerconfig";
+    const char* arguments[] = {linkerconfig_binary, "--target", linkerconfig_target, "--apex",
+                               apex_name.c_str(),   "--strict"};
+
+    if (logwrap_fork_execvp(arraysize(arguments), arguments, nullptr, false, LOG_KLOG, false,
+                            nullptr) != 0) {
+        return ErrnoError() << "failed to execute linkerconfig";
+    }
+    LOG(INFO) << "Generated linker configuration for " << apex_name;
+    return {};
+}
+
+static Result<void> DoLoadApex(const std::string& apex_name) {
+    std::string prop_name = "init.apex." + apex_name;
+    // TODO(b/232799709) read .rc files from the apex
+
+    if (auto result = UpdateApexLinkerConfig(apex_name); !result.ok()) {
+        return result.error();
+    }
+
+    SetProperty(prop_name, "loaded");
+    return {};
+}
+
 enum class ControlTarget {
     SERVICE,    // function gets called for the named service
     INTERFACE,  // action gets called for every service that holds this interface
@@ -431,6 +522,17 @@ static const std::map<std::string, ControlMessageFunction, std::less<>>& GetCont
     return control_message_functions;
 }
 
+static Result<void> HandleApexControlMessage(std::string_view action, const std::string& name,
+                                             std::string_view message) {
+    if (action == "load") {
+        return DoLoadApex(name);
+    } else if (action == "unload") {
+        return DoUnloadApex(name);
+    } else {
+        return Error() << "Unknown control msg '" << message << "'";
+    }
+}
+
 static bool HandleControlMessage(std::string_view message, const std::string& name,
                                  pid_t from_pid) {
     std::string cmdline_path = StringPrintf("proc/%d/cmdline", from_pid);
@@ -442,8 +544,20 @@ static bool HandleControlMessage(std::string_view message, const std::string& na
         process_cmdline = "unknown process";
     }
 
-    Service* service = nullptr;
     auto action = message;
+    if (ConsumePrefix(&action, "apex_")) {
+        if (auto result = HandleApexControlMessage(action, name, message); !result.ok()) {
+            LOG(ERROR) << "Control message: Could not ctl." << message << " for '" << name
+                       << "' from pid: " << from_pid << " (" << process_cmdline
+                       << "): " << result.error();
+            return false;
+        }
+        LOG(INFO) << "Control message: Processed ctl." << message << " for '" << name
+                  << "' from pid: " << from_pid << " (" << process_cmdline << ")";
+        return true;
+    }
+
+    Service* service = nullptr;
     if (ConsumePrefix(&action, "interface_")) {
         service = ServiceList::GetInstance().FindInterface(name);
     } else {

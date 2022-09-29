@@ -31,6 +31,7 @@ namespace fs_mgr {
 
 struct FstabEntry {
     std::string blk_device;
+    std::string zoned_device;
     std::string logical_partition_name;
     std::string mount_point;
     std::string fs_type;
@@ -95,6 +96,8 @@ using Fstab = std::vector<FstabEntry>;
 
 // Exported for testability. Regular users should use ReadFstabFromFile().
 bool ParseFstabFromString(const std::string& fstab_str, bool proc_mounts, Fstab* fstab_out);
+// Exported for testability. Regular users should use ReadDefaultFstab().
+std::string GetFstabPath();
 
 bool ReadFstabFromFile(const std::string& path, Fstab* fstab);
 bool ReadFstabFromDt(Fstab* fstab, bool verbose = true);

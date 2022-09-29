@@ -250,13 +250,24 @@ void Subcontext::Restart() {
     Fork();
 }
 
-bool Subcontext::PathMatchesSubcontext(const std::string& path) {
+bool Subcontext::PathMatchesSubcontext(const std::string& path) const {
+    static const std::string kApexDir = "/apex/";
+    if (StartsWith(path, kApexDir)) {
+        auto begin = kApexDir.size();
+        auto end = path.find('/', begin);
+        auto apex_name = path.substr(begin, end - begin);
+        return std::find(apex_list_.begin(), apex_list_.end(), apex_name) != apex_list_.end();
+    }
     for (const auto& prefix : path_prefixes_) {
         if (StartsWith(path, prefix)) {
             return true;
         }
     }
     return false;
+}
+
+void Subcontext::SetApexList(std::vector<std::string>&& apex_list) {
+    apex_list_ = std::move(apex_list);
 }
 
 Result<SubcontextReply> Subcontext::TransmitMessage(const SubcontextCommand& subcontext_command) {
@@ -370,6 +381,9 @@ bool SubcontextChildReap(pid_t pid) {
 }
 
 void SubcontextTerminate() {
+    if (!subcontext) {
+        return;
+    }
     subcontext_terminated_by_shutdown = true;
     kill(subcontext->pid(), SIGTERM);
 }
