@@ -13,6 +13,7 @@ cc_defaults {
         "-Wno-nullability-completeness",
         "-Os",
         "-DANDROID_DEBUGGABLE=0",
+        "-fno-finite-loops",
     ],
 
     local_include_dirs: ["include"],
