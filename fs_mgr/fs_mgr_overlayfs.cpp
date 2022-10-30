@@ -68,6 +68,8 @@ using android::fiemap::IImageManager;
 
 namespace {
 
+constexpr char kDataScratchSizeMbProp[] = "fs_mgr.overlayfs.data_scratch_size_mb";
+
 bool fs_mgr_access(const std::string& path) {
     return access(path.c_str(), F_OK) == 0;
 }
@@ -200,6 +202,24 @@ bool fs_mgr_has_shared_blocks(const std::string& mount_point, const std::string&
     return (info.feat_ro_compat & EXT4_FEATURE_RO_COMPAT_SHARED_BLOCKS) != 0;
 }
 
+#define F2FS_SUPER_OFFSET 1024
+#define F2FS_FEATURE_OFFSET 2180
+#define F2FS_FEATURE_RO 0x4000
+bool fs_mgr_is_read_only_f2fs(const std::string& dev) {
+    if (!fs_mgr_is_f2fs(dev)) return false;
+
+    android::base::unique_fd fd(open(dev.c_str(), O_RDONLY | O_CLOEXEC));
+    if (fd < 0) return false;
+
+    __le32 feat;
+    if ((TEMP_FAILURE_RETRY(lseek64(fd, F2FS_SUPER_OFFSET + F2FS_FEATURE_OFFSET, SEEK_SET)) < 0) ||
+        (TEMP_FAILURE_RETRY(read(fd, &feat, sizeof(feat))) < 0)) {
+        return false;
+    }
+
+    return (feat & cpu_to_le32(F2FS_FEATURE_RO)) != 0;
+}
+
 bool fs_mgr_overlayfs_enabled(FstabEntry* entry) {
     // readonly filesystem, can not be mount -o remount,rw
     // for squashfs, erofs or if free space is (near) zero making such a remount
@@ -211,6 +231,11 @@ bool fs_mgr_overlayfs_enabled(FstabEntry* entry) {
     // blk_device needs to be setup so we can check superblock.
     // If we fail here, because during init first stage and have doubts.
     if (!fs_mgr_update_blk_device(entry)) {
+        return true;
+    }
+
+    // f2fs read-only mode doesn't support remount,rw
+    if (fs_mgr_is_read_only_f2fs(entry->blk_device)) {
         return true;
     }
 
@@ -1061,7 +1086,10 @@ static bool CreateScratchOnData(std::string* scratch_device, bool* partition_exi
         return false;
     }
     if (!images->BackingImageExists(partition_name)) {
-        uint64_t size = GetIdealDataScratchSize();
+        auto size = android::base::GetUintProperty<uint64_t>(kDataScratchSizeMbProp, 0) * 1_MiB;
+        if (!size) {
+            size = GetIdealDataScratchSize();
+        }
         if (!size) {
             size = 2_GiB;
         }
@@ -1080,7 +1108,7 @@ static bool CreateScratchOnData(std::string* scratch_device, bool* partition_exi
     return true;
 }
 
-static bool CanUseSuperPartition(const Fstab& fstab, bool* is_virtual_ab) {
+static bool CanUseSuperPartition(const Fstab& fstab) {
     auto slot_number = fs_mgr_overlayfs_slot_number();
     auto super_device = fs_mgr_overlayfs_super_device(slot_number);
     if (!fs_mgr_rw_access(super_device) || !fs_mgr_overlayfs_has_logical(fstab)) {
@@ -1090,7 +1118,6 @@ static bool CanUseSuperPartition(const Fstab& fstab, bool* is_virtual_ab) {
     if (!metadata) {
         return false;
     }
-    *is_virtual_ab = !!(metadata->header.flags & LP_HEADER_FLAG_VIRTUAL_AB_DEVICE);
     return true;
 }
 
@@ -1103,12 +1130,13 @@ bool fs_mgr_overlayfs_create_scratch(const Fstab& fstab, std::string* scratch_de
         return *partition_exists;
     }
 
-    bool is_virtual_ab = false;
-    if (CanUseSuperPartition(fstab, &is_virtual_ab)) {
-        bool can_use_data = false;
-        if (is_virtual_ab && FilesystemHasReliablePinning("/data", &can_use_data) && can_use_data) {
-            return CreateScratchOnData(scratch_device, partition_exists);
-        }
+    // Try ImageManager on /data first.
+    bool can_use_data = false;
+    if (FilesystemHasReliablePinning("/data", &can_use_data) && can_use_data) {
+        return CreateScratchOnData(scratch_device, partition_exists);
+    }
+    // If that fails, see if we can land on super.
+    if (CanUseSuperPartition(fstab)) {
         return CreateDynamicScratch(scratch_device, partition_exists);
     }
     return false;
