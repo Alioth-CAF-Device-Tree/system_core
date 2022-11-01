@@ -38,11 +38,16 @@ static_assert(sizeof(off_t) == sizeof(uint64_t));
 using android::base::borrowed_fd;
 using android::base::unique_fd;
 
-bool ICowWriter::AddCopy(uint64_t new_block, uint64_t old_block) {
-    if (!ValidateNewBlock(new_block)) {
-        return false;
+bool ICowWriter::AddCopy(uint64_t new_block, uint64_t old_block, uint64_t num_blocks) {
+    CHECK(num_blocks != 0);
+
+    for (size_t i = 0; i < num_blocks; i++) {
+        if (!ValidateNewBlock(new_block + i)) {
+            return false;
+        }
     }
-    return EmitCopy(new_block, old_block);
+
+    return EmitCopy(new_block, old_block, num_blocks);
 }
 
 bool ICowWriter::AddRawBlocks(uint64_t new_block_start, const void* data, size_t size) {
@@ -286,13 +291,20 @@ bool CowWriter::OpenForAppend(uint64_t label) {
     return EmitClusterIfNeeded();
 }
 
-bool CowWriter::EmitCopy(uint64_t new_block, uint64_t old_block) {
+bool CowWriter::EmitCopy(uint64_t new_block, uint64_t old_block, uint64_t num_blocks) {
     CHECK(!merge_in_progress_);
-    CowOperation op = {};
-    op.type = kCowCopyOp;
-    op.new_block = new_block;
-    op.source = old_block;
-    return WriteOperation(op);
+
+    for (size_t i = 0; i < num_blocks; i++) {
+        CowOperation op = {};
+        op.type = kCowCopyOp;
+        op.new_block = new_block + i;
+        op.source = old_block + i;
+        if (!WriteOperation(op)) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool CowWriter::EmitRawBlocks(uint64_t new_block_start, const void* data, size_t size) {
@@ -402,67 +414,6 @@ bool CowWriter::EmitClusterIfNeeded() {
         if (!EmitCluster()) return false;
     }
     return true;
-}
-
-std::basic_string<uint8_t> CowWriter::Compress(const void* data, size_t length) {
-    switch (compression_) {
-        case kCowCompressGz: {
-            const auto bound = compressBound(length);
-            std::basic_string<uint8_t> buffer(bound, '\0');
-
-            uLongf dest_len = bound;
-            auto rv = compress2(buffer.data(), &dest_len, reinterpret_cast<const Bytef*>(data),
-                                length, Z_BEST_COMPRESSION);
-            if (rv != Z_OK) {
-                LOG(ERROR) << "compress2 returned: " << rv;
-                return {};
-            }
-            buffer.resize(dest_len);
-            return buffer;
-        }
-        case kCowCompressBrotli: {
-            const auto bound = BrotliEncoderMaxCompressedSize(length);
-            if (!bound) {
-                LOG(ERROR) << "BrotliEncoderMaxCompressedSize returned 0";
-                return {};
-            }
-            std::basic_string<uint8_t> buffer(bound, '\0');
-
-            size_t encoded_size = bound;
-            auto rv = BrotliEncoderCompress(
-                    BROTLI_DEFAULT_QUALITY, BROTLI_DEFAULT_WINDOW, BROTLI_DEFAULT_MODE, length,
-                    reinterpret_cast<const uint8_t*>(data), &encoded_size, buffer.data());
-            if (!rv) {
-                LOG(ERROR) << "BrotliEncoderCompress failed";
-                return {};
-            }
-            buffer.resize(encoded_size);
-            return buffer;
-        }
-        case kCowCompressLz4: {
-            const auto bound = LZ4_compressBound(length);
-            if (!bound) {
-                LOG(ERROR) << "LZ4_compressBound returned 0";
-                return {};
-            }
-            std::basic_string<uint8_t> buffer(bound, '\0');
-
-            const auto compressed_size = LZ4_compress_default(
-                    static_cast<const char*>(data), reinterpret_cast<char*>(buffer.data()), length,
-                    buffer.size());
-            if (compressed_size <= 0) {
-                LOG(ERROR) << "LZ4_compress_default failed, input size: " << length
-                           << ", compression bound: " << bound << ", ret: " << compressed_size;
-                return {};
-            }
-            buffer.resize(compressed_size);
-            return buffer;
-        }
-        default:
-            LOG(ERROR) << "unhandled compression type: " << compression_;
-            break;
-    }
-    return {};
 }
 
 // TODO: Fix compilation issues when linking libcrypto library
