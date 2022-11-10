@@ -69,6 +69,7 @@ using android::fiemap::IImageManager;
 namespace {
 
 constexpr char kDataScratchSizeMbProp[] = "fs_mgr.overlayfs.data_scratch_size_mb";
+constexpr char kPreferCacheBackingStorageProp[] = "fs_mgr.overlayfs.prefer_cache_backing_storage";
 
 bool fs_mgr_access(const std::string& path) {
     return access(path.c_str(), F_OK) == 0;
@@ -101,6 +102,10 @@ bool fs_mgr_is_dsu_running() {
 const auto kScratchMountPoint = "/mnt/scratch"s;
 const auto kCacheMountPoint = "/cache"s;
 
+bool IsABDevice() {
+    return !android::base::GetProperty("ro.boot.slot_suffix", "").empty();
+}
+
 std::vector<const std::string> OverlayMountPoints() {
     // Never fallback to legacy cache mount point if within a DSU system,
     // because running a DSU system implies the device supports dynamic
@@ -108,6 +113,15 @@ std::vector<const std::string> OverlayMountPoints() {
     if (fs_mgr_is_dsu_running()) {
         return {kScratchMountPoint};
     }
+
+    // For non-A/B devices prefer cache backing storage if
+    // kPreferCacheBackingStorageProp property set.
+    if (!IsABDevice() &&
+        android::base::GetBoolProperty(kPreferCacheBackingStorageProp, false) &&
+        android::base::GetIntProperty("ro.vendor.api_level", -1) < __ANDROID_API_T__) {
+        return {kCacheMountPoint, kScratchMountPoint};
+    }
+
     return {kScratchMountPoint, kCacheMountPoint};
 }
 
@@ -462,6 +476,28 @@ bool fs_mgr_overlayfs_umount_scratch() {
     return true;
 }
 
+OverlayfsTeardownResult TeardownDataScratch(IImageManager* images,
+                                            const std::string& partition_name, bool was_mounted) {
+    if (!images) {
+        return OverlayfsTeardownResult::Error;
+    }
+    if (!images->DisableImage(partition_name)) {
+        return OverlayfsTeardownResult::Error;
+    }
+    if (was_mounted) {
+        // If overlayfs was mounted, don't bother trying to unmap since
+        // it'll fail and create error spam.
+        return OverlayfsTeardownResult::Busy;
+    }
+    if (!images->UnmapImageIfExists(partition_name)) {
+        return OverlayfsTeardownResult::Busy;
+    }
+    if (!images->DeleteBackingImage(partition_name)) {
+        return OverlayfsTeardownResult::Busy;
+    }
+    return OverlayfsTeardownResult::Ok;
+}
+
 OverlayfsTeardownResult fs_mgr_overlayfs_teardown_scratch(const std::string& overlay,
                                                           bool* change) {
     // umount and delete kScratchMountPoint storage if we have logical partitions
@@ -484,24 +520,9 @@ OverlayfsTeardownResult fs_mgr_overlayfs_teardown_scratch(const std::string& ove
 
     auto images = IImageManager::Open("remount", 10s);
     if (images && images->BackingImageExists(partition_name)) {
-        if (!images->DisableImage(partition_name)) {
-            return OverlayfsTeardownResult::Error;
-        }
-        if (was_mounted) {
-            // If overlayfs was mounted, don't bother trying to unmap since
-            // it'll fail and create error spam.
-            return OverlayfsTeardownResult::Busy;
-        }
-        if (!images->UnmapImageIfExists(partition_name)) {
-            return OverlayfsTeardownResult::Busy;
-        }
-        if (!images->DeleteBackingImage(partition_name)) {
-            return OverlayfsTeardownResult::Busy;
-        }
-
         // No need to check super partition, if we knew we had a scratch device
         // in /data.
-        return OverlayfsTeardownResult::Ok;
+        return TeardownDataScratch(images.get(), partition_name, was_mounted);
     }
 
     auto slot_number = fs_mgr_overlayfs_slot_number();
@@ -1103,6 +1124,8 @@ static bool CreateScratchOnData(std::string* scratch_device, bool* partition_exi
     }
     if (!images->MapImageDevice(partition_name, 10s, scratch_device)) {
         LERROR << "could not map scratch image";
+        // If we cannot use this image, then remove it.
+        TeardownDataScratch(images.get(), partition_name, false /* was_mounted */);
         return false;
     }
     return true;
@@ -1136,6 +1159,7 @@ bool fs_mgr_overlayfs_create_scratch(const Fstab& fstab, std::string* scratch_de
         if (CreateScratchOnData(scratch_device, partition_exists)) {
             return true;
         }
+        LOG(WARNING) << "Failed to allocate scratch on /data, fallback to use free space on super";
     }
     // If that fails, see if we can land on super.
     if (CanUseSuperPartition(fstab)) {
