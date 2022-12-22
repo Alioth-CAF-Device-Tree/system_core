@@ -22,6 +22,7 @@
 #include <sys/vfs.h>
 #include <unistd.h>
 
+#include <iostream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -33,14 +34,16 @@
 #include <android-base/strings.h>
 #include <android/os/IVold.h>
 #include <binder/IServiceManager.h>
+#include <binder/ProcessState.h>
 #include <bootloader_message/bootloader_message.h>
 #include <cutils/android_reboot.h>
-#include <fec/io.h>
 #include <fs_mgr_overlayfs.h>
 #include <fs_mgr_priv.h>
 #include <fstab/fstab.h>
 #include <libavb_user/libavb_user.h>
 #include <libgsi/libgsid.h>
+
+#include "fs_mgr_priv_overlayfs.h"
 
 using namespace std::literals;
 using android::fs_mgr::Fstab;
@@ -48,20 +51,35 @@ using android::fs_mgr::FstabEntry;
 
 namespace {
 
-[[noreturn]] void usage(int exit_status) {
-    LOG(INFO) << getprogname()
-              << " [-h] [-R] [-T fstab_file] [partition]...\n"
-                 "\t-h --help\tthis help\n"
-                 "\t-R --reboot\tdisable verity & reboot to facilitate remount\n"
-                 "\t-T --fstab\tcustom fstab file location\n"
-                 "\tpartition\tspecific partition(s) (empty does all)\n"
-                 "\n"
-                 "Remount specified partition(s) read-write, by name or mount point.\n"
-                 "-R notwithstanding, verity must be disabled on partition(s).\n"
-                 "-R within a DSU guest system reboots into the DSU instead of the host system,\n"
-                 "this command would enable DSU (one-shot) if not already enabled.";
+void usage() {
+    const std::string progname = getprogname();
+    if (progname == "disable-verity" || progname == "enable-verity" ||
+        progname == "set-verity-state") {
+        std::cout << "Usage: disable-verity\n"
+                  << "       enable-verity\n"
+                  << "       set-verity-state [0|1]\n"
+                  << R"(
+Options:
+    -h --help       this help
+    -R --reboot     automatic reboot if needed for new settings to take effect
+    -v --verbose    be noisy)"
+                  << std::endl;
+    } else {
+        std::cout << "Usage: " << progname << " [-h] [-R] [-T fstab_file] [partition]...\n"
+                  << R"(
+Options:
+    -h --help       this help
+    -R --reboot     disable verity & reboot to facilitate remount
+    -v --verbose    be noisy
+    -T --fstab      custom fstab file location
+    partition       specific partition(s) (empty does all)
 
-    ::exit(exit_status);
+Remount specified partition(s) read-write, by name or mount point.
+-R notwithstanding, verity must be disabled on partition(s).
+-R within a DSU guest system reboots into the DSU instead of the host system,
+this command would enable DSU (one-shot) if not already enabled.)"
+                  << std::endl;
+    }
 }
 
 const std::string system_mount_point(const android::fs_mgr::FstabEntry& entry) {
@@ -80,23 +98,32 @@ const FstabEntry* GetWrappedEntry(const Fstab& overlayfs_candidates, const Fstab
     return &(*it);
 }
 
-auto verbose = false;
+class MyLogger {
+  public:
+    explicit MyLogger(bool verbose) : verbose_(verbose) {}
 
-void MyLogger(android::base::LogId id, android::base::LogSeverity severity, const char* tag,
-              const char* file, unsigned int line, const char* message) {
-    if (verbose || severity == android::base::ERROR || message[0] != '[') {
-        fprintf(stderr, "%s\n", message);
+    void operator()(android::base::LogId id, android::base::LogSeverity severity, const char* tag,
+                    const char* file, unsigned int line, const char* message) {
+        // By default, print ERROR logs and logs of this program (does not start with '[')
+        // Print [libfs_mgr] INFO logs only if -v is given.
+        if (verbose_ || severity >= android::base::ERROR || message[0] != '[') {
+            fprintf(stderr, "%s\n", message);
+        }
+        logd_(id, severity, tag, file, line, message);
     }
-    static auto logd = android::base::LogdLogger();
-    logd(id, severity, tag, file, line, message);
-}
 
-[[noreturn]] void reboot() {
+  private:
+    android::base::LogdLogger logd_;
+    bool verbose_;
+};
+
+[[noreturn]] void reboot(const std::string& name) {
     LOG(INFO) << "Rebooting device for new settings to take effect";
     ::sync();
-    android::base::SetProperty(ANDROID_RB_PROPERTY, "reboot,remount");
+    android::base::SetProperty(ANDROID_RB_PROPERTY, "reboot," + name);
     ::sleep(60);
-    ::exit(0);  // SUCCESS
+    LOG(ERROR) << "Failed to reboot";
+    ::exit(1);
 }
 
 static android::sp<android::os::IVold> GetVold() {
@@ -112,17 +139,9 @@ static android::sp<android::os::IVold> GetVold() {
     }
 }
 
-}  // namespace
-
-using namespace std::chrono_literals;
-
 enum RemountStatus {
     REMOUNT_SUCCESS = 0,
-    NOT_USERDEBUG,
-    BADARG,
-    NOT_ROOT,
-    NO_FSTAB,
-    UNKNOWN_PARTITION,
+    UNKNOWN_PARTITION = 5,
     INVALID_PARTITION,
     VERITY_PARTITION,
     BAD_OVERLAY,
@@ -279,23 +298,13 @@ static RemountStatus CheckVerity(const FstabEntry& entry, RemountCheckResult* re
     if (!fs_mgr_is_verity_enabled(entry)) {
         return REMOUNT_SUCCESS;
     }
-    if (android::base::GetProperty("ro.boot.vbmeta.device_state", "") == "locked") {
-        return VERITY_PARTITION;
-    }
-
-    bool ok = false;
 
     std::unique_ptr<AvbOps, decltype(&::avb_ops_user_free)> ops(avb_ops_user_new(),
                                                                 &::avb_ops_user_free);
-    if (ops) {
-        auto suffix = android::base::GetProperty("ro.boot.slot_suffix", "");
-        ok = avb_user_verity_set(ops.get(), suffix.c_str(), false);
+    if (!ops) {
+        return VERITY_PARTITION;
     }
-    if (!ok && fs_mgr_set_blk_ro(entry.blk_device, false)) {
-        fec::io fh(entry.blk_device.c_str(), O_RDWR);
-        ok = fh && fh.set_verity_status(false);
-    }
-    if (!ok) {
+    if (!avb_user_verity_set(ops.get(), fs_mgr_get_slot_suffix().c_str(), false)) {
         return VERITY_PARTITION;
     }
     result->disabled_verity = true;
@@ -317,15 +326,15 @@ static RemountStatus CheckVerityAndOverlayfs(Fstab* partitions, RemountCheckResu
         }
 
         if (fs_mgr_wants_overlayfs(&entry)) {
-            bool change = false;
+            bool want_reboot = false;
             bool force = result->disabled_verity;
-            if (!fs_mgr_overlayfs_setup(mount_point.c_str(), &change, force)) {
+            if (!fs_mgr_overlayfs_setup(mount_point.c_str(), &want_reboot, force)) {
                 LOG(ERROR) << "Overlayfs setup for " << mount_point << " failed, skipping";
                 status = BAD_OVERLAY;
                 it = partitions->erase(it);
                 continue;
             }
-            if (change) {
+            if (want_reboot) {
                 LOG(INFO) << "Using overlayfs for " << mount_point;
                 result->reboot_later = true;
                 result->setup_overlayfs = true;
@@ -429,6 +438,68 @@ static RemountStatus RemountPartition(Fstab& fstab, Fstab& mounts, FstabEntry& e
     return REMOUNT_FAILED;
 }
 
+struct SetVerityStateResult {
+    bool success = false;
+    bool want_reboot = false;
+};
+
+SetVerityStateResult SetVerityState(bool enable_verity) {
+    const auto ab_suffix = android::base::GetProperty("ro.boot.slot_suffix", "");
+    bool verity_enabled = false;
+
+    std::unique_ptr<AvbOps, decltype(&avb_ops_user_free)> ops(avb_ops_user_new(),
+                                                              &avb_ops_user_free);
+    if (!ops) {
+        LOG(ERROR) << "Error getting AVB ops";
+        return {};
+    }
+
+    if (!avb_user_verity_get(ops.get(), ab_suffix.c_str(), &verity_enabled)) {
+        LOG(ERROR) << "Error getting verity state";
+        return {};
+    }
+
+    if ((verity_enabled && enable_verity) || (!verity_enabled && !enable_verity)) {
+        LOG(INFO) << "Verity is already " << (verity_enabled ? "enabled" : "disabled");
+        return {.success = true, .want_reboot = false};
+    }
+
+    if (!avb_user_verity_set(ops.get(), ab_suffix.c_str(), enable_verity)) {
+        LOG(ERROR) << "Error setting verity state";
+        return {};
+    }
+
+    LOG(INFO) << "Successfully " << (enable_verity ? "enabled" : "disabled") << " verity";
+    return {.success = true, .want_reboot = true};
+}
+
+bool SetupOrTeardownOverlayfs(bool enable) {
+    bool want_reboot = false;
+    if (enable) {
+        if (!fs_mgr_overlayfs_setup(nullptr, &want_reboot)) {
+            LOG(ERROR) << "Overlayfs setup failed.";
+            return want_reboot;
+        }
+        if (want_reboot) {
+            printf("enabling overlayfs\n");
+        }
+    } else {
+        auto rv = fs_mgr_overlayfs_teardown(nullptr, &want_reboot);
+        if (rv == OverlayfsTeardownResult::Error) {
+            LOG(ERROR) << "Overlayfs teardown failed.";
+            return want_reboot;
+        }
+        if (rv == OverlayfsTeardownResult::Busy) {
+            LOG(ERROR) << "Overlayfs is still active until reboot.";
+            return true;
+        }
+        if (want_reboot) {
+            printf("disabling overlayfs\n");
+        }
+    }
+    return want_reboot;
+}
+
 static int do_remount(Fstab& fstab, const std::vector<std::string>& partition_args,
                       RemountCheckResult* check_result) {
     Fstab partitions;
@@ -451,10 +522,9 @@ static int do_remount(Fstab& fstab, const std::vector<std::string>& partition_ar
     }
 
     // Mount overlayfs.
-    errno = 0;
-    if (!fs_mgr_overlayfs_mount_all(&partitions) && errno) {
-        PLOG(ERROR) << "Can not mount overlayfs for partitions";
-        return BAD_OVERLAY;
+    if (!fs_mgr_overlayfs_mount_all(&partitions)) {
+        LOG(WARNING) << "Cannot mount overlayfs for some partitions";
+        // Continue regardless to handle raw remount case.
     }
 
     // Get actual mounts _after_ overlayfs has been added.
@@ -475,6 +545,8 @@ static int do_remount(Fstab& fstab, const std::vector<std::string>& partition_ar
     return retval;
 }
 
+}  // namespace
+
 int main(int argc, char* argv[]) {
     // Do not use MyLogger() when running as clean_scratch_files, as stdout/stderr of daemon process
     // are discarded.
@@ -483,24 +555,11 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    android::base::InitLogging(argv, MyLogger);
-
-    // Make sure we are root.
-    if (::getuid() != 0) {
-        LOG(ERROR) << "Not running as root. Try \"adb root\" first.";
-        return NOT_ROOT;
-    }
-
-    // If somehow this executable is delivered on a "user" build, it can
-    // not function, so providing a clear message to the caller rather than
-    // letting if fall through and provide a lot of confusing failure messages.
-    if (!ALLOW_ADBD_DISABLE_VERITY || (android::base::GetProperty("ro.debuggable", "0") != "1")) {
-        LOG(ERROR) << "only functions on userdebug or eng builds";
-        return NOT_USERDEBUG;
-    }
+    android::base::InitLogging(argv, MyLogger(false /* verbose */));
 
     const char* fstab_file = nullptr;
-    auto auto_reboot = false;
+    bool auto_reboot = false;
+    bool verbose = false;
     std::vector<std::string> partition_args;
 
     struct option longopts[] = {
@@ -513,15 +572,16 @@ int main(int argc, char* argv[]) {
     for (int opt; (opt = ::getopt_long(argc, argv, "hRT:v", longopts, nullptr)) != -1;) {
         switch (opt) {
             case 'h':
-                usage(SUCCESS);
-                break;
+                usage();
+                return 0;
             case 'R':
                 auto_reboot = true;
                 break;
             case 'T':
                 if (fstab_file) {
-                    LOG(ERROR) << "Cannot supply two fstabs: -T " << fstab_file << " -T" << optarg;
-                    usage(BADARG);
+                    LOG(ERROR) << "Cannot supply two fstabs: -T " << fstab_file << " -T " << optarg;
+                    usage();
+                    return 1;
                 }
                 fstab_file = optarg;
                 break;
@@ -529,14 +589,84 @@ int main(int argc, char* argv[]) {
                 verbose = true;
                 break;
             default:
-                LOG(ERROR) << "Bad Argument -" << char(opt);
-                usage(BADARG);
-                break;
+                LOG(ERROR) << "Bad argument -" << char(opt);
+                usage();
+                return 1;
         }
     }
 
-    for (; argc > optind; ++optind) {
-        partition_args.emplace_back(argv[optind]);
+    if (verbose) {
+        android::base::SetLogger(MyLogger(verbose));
+    }
+
+    bool remount = false;
+    bool enable_verity = false;
+    const std::string progname = getprogname();
+    if (progname == "enable-verity") {
+        enable_verity = true;
+    } else if (progname == "disable-verity") {
+        enable_verity = false;
+    } else if (progname == "set-verity-state") {
+        if (optind < argc && (argv[optind] == "1"s || argv[optind] == "0"s)) {
+            enable_verity = (argv[optind] == "1"s);
+        } else {
+            usage();
+            return 1;
+        }
+    } else {
+        remount = true;
+        for (; optind < argc; ++optind) {
+            partition_args.emplace_back(argv[optind]);
+        }
+    }
+
+    // Make sure we are root.
+    if (::getuid() != 0) {
+        LOG(ERROR) << "Not running as root. Try \"adb root\" first.";
+        return 1;
+    }
+
+    // If somehow this executable is delivered on a "user" build, it can
+    // not function, so providing a clear message to the caller rather than
+    // letting if fall through and provide a lot of confusing failure messages.
+    if (!ALLOW_ADBD_DISABLE_VERITY || !android::base::GetBoolProperty("ro.debuggable", false)) {
+        LOG(ERROR) << "Device must be userdebug build";
+        return 1;
+    }
+
+    if (android::base::GetProperty("ro.boot.vbmeta.device_state", "") == "locked") {
+        LOG(ERROR) << "Device must be bootloader unlocked";
+        return 1;
+    }
+
+    // Start a threadpool to service waitForService() callbacks as
+    // fs_mgr_overlayfs_* might call waitForService() to get the image service.
+    android::ProcessState::self()->startThreadPool();
+
+    if (!remount) {
+        // Figure out if we're using VB1.0 or VB2.0 (aka AVB) - by
+        // contract, androidboot.vbmeta.digest is set by the bootloader
+        // when using AVB).
+        if (android::base::GetProperty("ro.boot.vbmeta.digest", "").empty()) {
+            LOG(ERROR) << "Expected AVB device, VB1.0 is no longer supported";
+            return 1;
+        }
+
+        auto ret = SetVerityState(enable_verity);
+
+        // Disable any overlayfs unconditionally if we want verity enabled.
+        // Enable overlayfs only if verity is successfully disabled or is already disabled.
+        if (enable_verity || ret.success) {
+            ret.want_reboot |= SetupOrTeardownOverlayfs(!enable_verity);
+        }
+
+        if (ret.want_reboot) {
+            if (auto_reboot) {
+                reboot(progname);
+            }
+            std::cout << "Reboot the device for new settings to take effect" << std::endl;
+        }
+        return ret.success ? 0 : 1;
     }
 
     // Make sure checkpointing is disabled if necessary.
@@ -548,7 +678,7 @@ int main(int argc, char* argv[]) {
     Fstab fstab;
     if (!ReadFstab(fstab_file, &fstab) || fstab.empty()) {
         PLOG(ERROR) << "Failed to read fstab";
-        return NO_FSTAB;
+        return 1;
     }
 
     RemountCheckResult check_result;
@@ -561,7 +691,11 @@ int main(int argc, char* argv[]) {
     } else if (check_result.setup_overlayfs) {
         LOG(INFO) << "Overlayfs enabled.";
     }
-
+    if (result == REMOUNT_SUCCESS) {
+        LOG(INFO) << "remount succeeded";
+    } else {
+        LOG(ERROR) << "remount failed";
+    }
     if (check_result.reboot_later) {
         if (auto_reboot) {
             // If (1) remount requires a reboot to take effect, (2) system is currently
@@ -572,16 +706,11 @@ int main(int argc, char* argv[]) {
                 LOG(ERROR) << "Unable to automatically enable DSU";
                 return rv;
             }
-            reboot();
+            reboot("remount");
         } else {
             LOG(INFO) << "Now reboot your device for settings to take effect";
         }
         return REMOUNT_SUCCESS;
-    }
-    if (result == REMOUNT_SUCCESS) {
-        printf("remount succeeded\n");
-    } else {
-        printf("remount failed\n");
     }
     return result;
 }

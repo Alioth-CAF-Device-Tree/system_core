@@ -40,6 +40,8 @@
 #include <storage_literals/storage_literals.h>
 #include <uuid/uuid.h>
 
+#include <bootloader_message/bootloader_message.h>
+
 #include "BootControlClient.h"
 #include "constants.h"
 #include "fastboot_device.h"
@@ -55,8 +57,6 @@ static constexpr bool kEnableFetch = false;
 using android::fs_mgr::MetadataBuilder;
 using android::hal::CommandResult;
 using ::android::hardware::hidl_string;
-using ::android::hardware::fastboot::V1_0::Result;
-using ::android::hardware::fastboot::V1_0::Status;
 using android::snapshot::SnapshotManager;
 using MergeStatus = android::hal::BootControlClient::MergeStatus;
 
@@ -154,6 +154,14 @@ static bool GetVarAll(FastbootDevice* device) {
     return true;
 }
 
+static void PostWipeData() {
+    std::string err;
+    // Reset mte state of device.
+    if (!WriteMiscMemtagMessage({}, &err)) {
+        LOG(ERROR) << "Failed to reset MTE state: " << err;
+    }
+}
+
 const std::unordered_map<std::string, std::function<bool(FastbootDevice*)>> kSpecialVars = {
         {"all", GetVarAll},
         {"dmesg", GetDmesg},
@@ -193,20 +201,21 @@ bool OemPostWipeData(FastbootDevice* device) {
         return false;
     }
 
-    Result ret;
-    auto ret_val = fastboot_hal->doOemSpecificErase([&](Result result) { ret = result; });
-    if (!ret_val.isOk()) {
-        return false;
-    }
-    if (ret.status == Status::NOT_SUPPORTED) {
-        return false;
-    } else if (ret.status != Status::SUCCESS) {
-        device->WriteStatus(FastbootResult::FAIL, ret.message);
-    } else {
+    auto status = fastboot_hal->doOemSpecificErase();
+    if (status.isOk()) {
         device->WriteStatus(FastbootResult::OKAY, "Erasing succeeded");
+        return true;
     }
-
-    return true;
+    switch (status.getExceptionCode()) {
+        case EX_UNSUPPORTED_OPERATION:
+            return false;
+        case EX_SERVICE_SPECIFIC:
+            device->WriteStatus(FastbootResult::FAIL, status.getDescription());
+            return false;
+        default:
+            LOG(ERROR) << "Erase operation failed" << status.getDescription();
+            return false;
+    }
 }
 
 bool EraseHandler(FastbootDevice* device, const std::vector<std::string>& args) {
@@ -232,6 +241,7 @@ bool EraseHandler(FastbootDevice* device, const std::vector<std::string>& args) 
         //Perform oem PostWipeData if Android userdata partition has been erased
         bool support_oem_postwipedata = false;
         if (partition_name == "userdata") {
+            PostWipeData();
             support_oem_postwipedata = OemPostWipeData(device);
         }
 
@@ -255,18 +265,16 @@ bool OemCmdHandler(FastbootDevice* device, const std::vector<std::string>& args)
     if (args[0] == "oem postwipedata userdata") {
         return device->WriteStatus(FastbootResult::FAIL, "Unable to do oem postwipedata userdata");
     }
-
-    Result ret;
-    auto ret_val = fastboot_hal->doOemCommand(args[0], [&](Result result) { ret = result; });
-    if (!ret_val.isOk()) {
-        return device->WriteStatus(FastbootResult::FAIL, "Unable to do OEM command");
-    }
-    if (ret.status != Status::SUCCESS) {
-        return device->WriteStatus(FastbootResult::FAIL, ret.message);
+    std::string message;
+    auto status = fastboot_hal->doOemCommand(args[0], &message);
+    if (!status.isOk()) {
+        LOG(ERROR) << "Unable to do OEM command " << args[0].c_str() << status.getDescription();
+        return device->WriteStatus(FastbootResult::FAIL,
+                                   "Unable to do OEM command " + status.getDescription());
     }
 
-    device->WriteInfo(ret.message);
-    return device->WriteStatus(FastbootResult::OKAY, ret.message);
+    device->WriteInfo(message);
+    return device->WriteStatus(FastbootResult::OKAY, message);
 }
 
 bool DownloadHandler(FastbootDevice* device, const std::vector<std::string>& args) {
@@ -610,6 +618,10 @@ bool FlashHandler(FastbootDevice* device, const std::vector<std::string>& args) 
     if (ret < 0) {
         return device->WriteStatus(FastbootResult::FAIL, strerror(-ret));
     }
+    if (partition_name == "userdata") {
+        PostWipeData();
+    }
+
     return device->WriteStatus(FastbootResult::OKAY, "Flashing succeeded");
 }
 

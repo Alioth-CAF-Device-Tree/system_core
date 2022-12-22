@@ -12,9 +12,16 @@ cc_defaults {
         "-Wno-unused-function",
         "-Wno-nullability-completeness",
         "-Os",
+        "-DANDROID_DEBUGGABLE=0",
+        "-fno-finite-loops",
     ],
 
     local_include_dirs: ["include"],
+    product_variables: {
+        debuggable: {
+            cflags: ["-UANDROID_DEBUGGABLE", "-DANDROID_DEBUGGABLE=1"],
+        }
+    },
 }
 
 cc_library_headers {
@@ -418,8 +425,8 @@ cc_binary {
     local_include_dirs: ["include"],
 }
 
-cc_binary {
-    name: "tombstoned",
+cc_defaults {
+    name: "tombstoned_defaults",
     srcs: [
         "util.cpp",
         "tombstoned/intercept_manager.cpp",
@@ -438,8 +445,18 @@ cc_binary {
         "libevent",
         "liblog",
     ],
+}
 
+cc_binary {
+    name: "tombstoned",
+    defaults: ["tombstoned_defaults"],
     init_rc: ["tombstoned/tombstoned.rc"],
+}
+
+cc_binary {
+    name: "tombstoned.microdroid",
+    defaults: ["tombstoned_defaults"],
+    init_rc: ["tombstoned/tombstoned.microdroid.rc"],
 }
 
 prebuilt_etc {
@@ -452,6 +469,9 @@ prebuilt_etc {
         },
         arm64: {
             src: "seccomp_policy/crash_dump.arm64.policy",
+        },
+        riscv64: {
+            src: "seccomp_policy/crash_dump.riscv64.policy",
         },
         x86: {
             src: "seccomp_policy/crash_dump.x86.policy",

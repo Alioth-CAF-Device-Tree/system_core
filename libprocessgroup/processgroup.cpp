@@ -55,6 +55,11 @@ using namespace std::chrono_literals;
 
 #define PROCESSGROUP_CGROUP_PROCS_FILE "/cgroup.procs"
 
+bool CgroupsAvailable() {
+    static bool cgroups_available = access("/proc/cgroups", F_OK) == 0;
+    return cgroups_available;
+}
+
 bool CgroupGetControllerPath(const std::string& cgroup_name, std::string* path) {
     auto controller = CgroupMap::GetInstance().FindController(cgroup_name);
 
@@ -193,6 +198,11 @@ extern "C" bool android_set_process_profiles(uid_t uid, pid_t pid, size_t num_pr
         profiles_.emplace_back(profiles[i]);
     }
     return SetProcessProfiles(uid, pid, std::span<const std::string_view>(profiles_));
+}
+
+bool SetUserProfiles(uid_t uid, const std::vector<std::string>& profiles) {
+    return TaskProfiles::GetInstance().SetUserProfiles(uid, std::span<const std::string>(profiles),
+                                                       false);
 }
 
 static std::string ConvertUidToPath(const char* cgroup, uid_t uid) {

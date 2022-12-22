@@ -31,6 +31,7 @@
 
 #include "action.h"
 #include "capabilities.h"
+#include "interprocess_fifo.h"
 #include "keyword_map.h"
 #include "mount_namespace.h"
 #include "parser.h"
@@ -143,6 +144,8 @@ class Service {
         }
     }
     Subcontext* subcontext() const { return subcontext_; }
+    const std::string& filename() const { return filename_; }
+    void set_filename(const std::string& name) { filename_ = name; }
 
   private:
     void NotifyStateChange(const std::string& new_state) const;
@@ -152,9 +155,7 @@ class Service {
     void ResetFlagsForStart();
     Result<void> CheckConsole();
     void ConfigureMemcg();
-    void RunService(
-            const std::vector<Descriptor>& descriptors,
-            std::unique_ptr<std::array<int, 2>, void (*)(const std::array<int, 2>* pipe)> pipefd);
+    void RunService(const std::vector<Descriptor>& descriptors, InterprocessFifo fifo);
     void SetMountNamespace();
     static unsigned long next_start_order_;
     static bool is_exec_service_running_;
@@ -169,6 +170,7 @@ class Service {
     android::base::boot_clock::time_point time_started_;  // time of last start
     android::base::boot_clock::time_point time_crashed_;  // first crash within inspection window
     int crash_count_;                     // number of times crashed within window
+    bool upgraded_mte_ = false;           // whether we upgraded async MTE -> sync MTE before
     std::chrono::minutes fatal_crash_window_ = 4min;  // fatal() when more than 4 crashes in it
     std::optional<std::string> fatal_reboot_target_;  // reboot target of fatal handler
 
@@ -181,6 +183,8 @@ class Service {
     std::vector<SocketDescriptor> sockets_;
     std::vector<FileDescriptor> files_;
     std::vector<std::pair<std::string, std::string>> environment_vars_;
+    // Environment variables that only get applied to the next run.
+    std::vector<std::pair<std::string, std::string>> once_environment_vars_;
 
     Subcontext* subcontext_;
     Action onrestart_;  // Commands to execute on restart.

@@ -499,7 +499,7 @@ static Result<void> KillZramBackingDevice() {
         return ErrnoError() << "zram_backing_dev: swapoff (" << backing_dev << ")"
                             << " failed";
     }
-    LOG(INFO) << "swapoff() took " << swap_timer;;
+    LOG(INFO) << "swapoff() took " << swap_timer;
 
     if (!WriteStringToFile("1", ZRAM_RESET)) {
         return Error() << "zram_backing_dev: reset (" << backing_dev << ")"
@@ -575,6 +575,11 @@ int StopServicesAndLogViolations(const std::set<std::string>& services,
 }
 
 static Result<void> UnmountAllApexes() {
+    // don't need to unmount because apexd doesn't use /data in Microdroid
+    if (IsMicrodroid()) {
+        return {};
+    }
+
     const char* args[] = {"/system/bin/apexd", "--unmount-all"};
     int status;
     if (logwrap_fork_execvp(arraysize(args), args, &status, false, LOG_KLOG, true, nullptr) != 0) {
@@ -616,7 +621,7 @@ static void DoReboot(unsigned int cmd, const std::string& reason, const std::str
     if (sem_init(&reboot_semaphore, false, 0) == -1) {
         // These should never fail, but if they do, skip the graceful reboot and reboot immediately.
         LOG(ERROR) << "sem_init() fail and RebootSystem() return!";
-        RebootSystem(cmd, reboot_target);
+        RebootSystem(cmd, reboot_target, reason);
     }
 
     // Start a thread to monitor init shutdown process
@@ -644,7 +649,7 @@ static void DoReboot(unsigned int cmd, const std::string& reason, const std::str
     // worry about unmounting it.
     if (!IsDataMounted("*")) {
         sync();
-        RebootSystem(cmd, reboot_target);
+        RebootSystem(cmd, reboot_target, reason);
         abort();
     }
 
@@ -777,7 +782,7 @@ static void DoReboot(unsigned int cmd, const std::string& reason, const std::str
             LOG(INFO) << "Shutdown /data";
         }
     }
-    RebootSystem(cmd, reboot_target);
+    RebootSystem(cmd, reboot_target, reason);
     abort();
 }
 

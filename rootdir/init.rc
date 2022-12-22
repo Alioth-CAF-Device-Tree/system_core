@@ -813,6 +813,7 @@ on post-fs-data
     mkdir /data/misc/vpn 0770 system vpn
     mkdir /data/misc/shared_relro 0771 shared_relro shared_relro
     mkdir /data/misc/systemkeys 0700 system system
+    mkdir /data/misc/threadnetwork 0770 thread_network thread_network
     mkdir /data/misc/wifi 0770 wifi wifi
     mkdir /data/misc/wifi/sockets 0770 wifi wifi
     mkdir /data/misc/wifi/wpa_supplicant 0770 wifi wifi
@@ -956,22 +957,29 @@ on post-fs-data
     restorecon /data/media
     exec - media_rw media_rw -- /system/bin/chattr +F /data/media
 
-    # A tmpfs directory, which will contain all apps CE DE data directory that
-    # bind mount from the original source.
+    # A tmpfs directory, which will contain all apps and sdk sandbox CE and DE
+    # data directory that bind mount from the original source.
     mount tmpfs tmpfs /data_mirror nodev noexec nosuid mode=0700,uid=0,gid=1000
     restorecon /data_mirror
     mkdir /data_mirror/data_ce 0700 root root
     mkdir /data_mirror/data_de 0700 root root
+    mkdir /data_mirror/misc_ce 0700 root root
+    mkdir /data_mirror/misc_de 0700 root root
 
     # Create CE and DE data directory for default volume
     mkdir /data_mirror/data_ce/null 0700 root root
     mkdir /data_mirror/data_de/null 0700 root root
+    mkdir /data_mirror/misc_ce/null 0700 root root
+    mkdir /data_mirror/misc_de/null 0700 root root
 
     # Bind mount CE and DE data directory to mirror's default volume directory.
-    # The 'slave' option (MS_SLAVE) is needed to cause the later bind mount of
-    # /data/data onto /data/user/0 to propagate to /data_mirror/data_ce/null/0.
-    mount none /data/user /data_mirror/data_ce/null bind rec slave
+    # Note that because the /data mount has the "shared" propagation type, the
+    # later bind mount of /data/data onto /data/user/0 will automatically
+    # propagate to /data_mirror/data_ce/null/0 as well.
+    mount none /data/user /data_mirror/data_ce/null bind rec
     mount none /data/user_de /data_mirror/data_de/null bind rec
+    mount none /data/misc_ce /data_mirror/misc_ce/null bind rec
+    mount none /data/misc_de /data_mirror/misc_de/null bind rec
 
     # Create mirror directory for jit profiles
     mkdir /data_mirror/cur_profiles 0700 root root
@@ -1052,6 +1060,9 @@ on post-fs-data
 
     # Enable FUSE by default
     setprop persist.sys.fuse true
+
+    # Update dm-verity state and set partition.*.verified properties.
+    verity_update_state
 
 # It is recommended to put unnecessary data/ initialization from post-fs-data
 # to start-zygote in device's init.rc to unblock zygote start.
@@ -1191,9 +1202,6 @@ on boot
     # Define default initial receive window size in segments.
     setprop net.tcp_def_init_rwnd 60
 
-    # Update dm-verity state and set partition.*.verified properties.
-    verity_update_state
-
     # Start standard binderized HAL daemons
     class_start hal
 
@@ -1238,7 +1246,7 @@ on property:net.tcp_def_init_rwnd=*
 # controlling access. On older kernels, the paranoid value is the only means of
 # controlling access. It is normally 3 (allow only root), but the shell user
 # can lower it to 1 (allowing thread-scoped pofiling) via security.perf_harden.
-on property:sys.init.perf_lsm_hooks=1
+on load_bpf_programs && property:sys.init.perf_lsm_hooks=1
     write /proc/sys/kernel/perf_event_paranoid -1
 on property:security.perf_harden=0 && property:sys.init.perf_lsm_hooks=""
     write /proc/sys/kernel/perf_event_paranoid 1
