@@ -1,5 +1,5 @@
 //
-// Copyright (C) 2016 The Android Open-Source Project
+// Copyright (C) 2022 The Android Open-Source Project
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,42 +12,30 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//
 
 package {
     default_applicable_licenses: ["Android-Apache-2.0"],
 }
 
-cc_binary {
-    name: "storageproxyd",
+rust_binary {
+    name: "android.hardware.security.keymint-service.rust.trusty",
+    relative_install_path: "hw",
     vendor: true,
-
+    init_rc: ["android.hardware.security.keymint-service.rust.trusty.rc"],
+    vintf_fragments: ["android.hardware.security.keymint-service.rust.trusty.xml"],
     srcs: [
-        "checkpoint_handling.cpp",
-        "ipc.c",
-        "rpmb.c",
-        "storage.c",
-        "proxy.c",
+        "src/keymint_hal_main.rs"
     ],
-
-    shared_libs: [
-        "libbase",
-        "libcutils",
-        "liblog",
-        "libhardware_legacy",
+    rustlibs: [
+        "libandroid_logger",
+        "libbinder_rs",
+        "libkmr_wire",
+        "libkmr_hal",
+        "libtrusty-rs",
+        "liblibc",
+        "liblog_rust",
     ],
-    header_libs: [
-        "libgsi_headers",
-    ],
-
-    static_libs: [
-        "libfstab",
-        "libtrustystorageinterface",
-        "libtrusty",
-    ],
-
-    cflags: [
-        "-Wall",
-        "-Werror",
+    required: [
+        "android.hardware.hardware_keystore.xml",
     ],
 }
