@@ -16,13 +16,16 @@
 
 #include <functional>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/properties.h>
+#include <android/api-level.h>
 #include <gtest/gtest.h>
 #include <selinux/selinux.h>
+#include <sys/resource.h>
 
 #include "action.h"
 #include "action_manager.h"
@@ -194,6 +197,10 @@ service A something
 }
 
 TEST(init, StartConsole) {
+    if (GetProperty("ro.build.type", "") == "user") {
+        GTEST_SKIP() << "Must run on userdebug/eng builds. b/262090304";
+        return;
+    }
     std::string init_script = R"init(
 service console /system/bin/sh
     class core
@@ -620,6 +627,105 @@ service A something
 
     ASSERT_TRUE(parser.ParseConfig(tf.path));
     ASSERT_EQ(1u, parser.parse_error_count());
+}
+
+TEST(init, MemLockLimit) {
+    // Test is enforced only for U+ devices
+    if (android::base::GetIntProperty("ro.vendor.api_level", 0) < __ANDROID_API_U__) {
+        GTEST_SKIP();
+    }
+
+    // Verify we are running memlock at, or under, 64KB
+    const unsigned long max_limit = 65536;
+    struct rlimit curr_limit;
+    ASSERT_EQ(getrlimit(RLIMIT_MEMLOCK, &curr_limit), 0);
+    ASSERT_LE(curr_limit.rlim_cur, max_limit);
+    ASSERT_LE(curr_limit.rlim_max, max_limit);
+}
+
+static std::vector<const char*> ConvertToArgv(const std::vector<std::string>& args) {
+    std::vector<const char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& arg : args) {
+        if (argv.empty()) {
+            LOG(DEBUG) << arg;
+        } else {
+            LOG(DEBUG) << "    " << arg;
+        }
+        argv.emplace_back(arg.data());
+    }
+    argv.emplace_back(nullptr);
+    return argv;
+}
+
+pid_t ForkExecvpAsync(const std::vector<std::string>& args) {
+    auto argv = ConvertToArgv(args);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(STDIN_FILENO);
+        close(STDOUT_FILENO);
+        close(STDERR_FILENO);
+
+        execvp(argv[0], const_cast<char**>(argv.data()));
+        PLOG(ERROR) << "exec in ForkExecvpAsync init test";
+        _exit(EXIT_FAILURE);
+    }
+    if (pid == -1) {
+        PLOG(ERROR) << "fork in ForkExecvpAsync init test";
+        return -1;
+    }
+    return pid;
+}
+
+TEST(init, GentleKill) {
+    std::string init_script = R"init(
+service test_gentle_kill /system/bin/sleep 1000
+    disabled
+    oneshot
+    gentle_kill
+    user root
+    group root
+    seclabel u:r:toolbox:s0
+)init";
+
+    ActionManager action_manager;
+    ServiceList service_list;
+    TestInitText(init_script, BuiltinFunctionMap(), {}, &action_manager, &service_list);
+    ASSERT_EQ(std::distance(service_list.begin(), service_list.end()), 1);
+
+    auto service = service_list.begin()->get();
+    ASSERT_NE(service, nullptr);
+    ASSERT_RESULT_OK(service->Start());
+    const pid_t pid = service->pid();
+    ASSERT_GT(pid, 0);
+    EXPECT_NE(getsid(pid), 0);
+
+    TemporaryFile logfile;
+    logfile.DoNotRemove();
+    ASSERT_TRUE(logfile.fd != -1);
+
+    std::vector<std::string> cmd;
+    cmd.push_back("system/bin/strace");
+    cmd.push_back("-o");
+    cmd.push_back(logfile.path);
+    cmd.push_back("-e");
+    cmd.push_back("signal");
+    cmd.push_back("-p");
+    cmd.push_back(std::to_string(pid));
+    pid_t strace_pid = ForkExecvpAsync(cmd);
+
+    // Give strace a moment to connect
+    std::this_thread::sleep_for(1s);
+    service->Stop();
+
+    int status;
+    waitpid(strace_pid, &status, 0);
+
+    std::string logs;
+    android::base::ReadFdToString(logfile.fd, &logs);
+    int pos = logs.find("killed by SIGTERM");
+    ASSERT_NE(pos, (int)std::string::npos);
 }
 
 class TestCaseLogger : public ::testing::EmptyTestEventListener {
