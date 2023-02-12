@@ -26,6 +26,7 @@
 #include <sys/time.h>
 #include <termios.h>
 #include <unistd.h>
+#include <thread>
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
@@ -700,8 +701,9 @@ Result<void> Service::Start() {
             if (!result.ok()) {
                 return Error() << "Sending notification failed: " << result.error();
             }
-            return Error() << "createProcessGroup(" << proc_attr_.uid << ", " << pid_
-                           << ") failed for service '" << name_ << "'";
+            return Error() << "createProcessGroup(" << proc_attr_.uid << ", " << pid_ << ", "
+                           << use_memcg << ") failed for service '" << name_
+                           << "': " << strerror(errno);
         }
 
         // When the blkio controller is mounted in the v1 hierarchy, NormalIoPriority is
@@ -886,6 +888,10 @@ void Service::StopOrReset(int how) {
     }
 
     if (pid_) {
+        if (flags_ & SVC_GENTLE_KILL) {
+            KillProcessGroup(SIGTERM);
+            if (!process_cgroup_empty()) std::this_thread::sleep_for(200ms);
+        }
         KillProcessGroup(SIGKILL);
         NotifyStateChange("stopping");
     } else {
