@@ -1498,6 +1498,7 @@ void SnapshotManager::AcknowledgeMergeSuccess(LockedFile* lock) {
     if (UpdateUsesUserSnapshots(lock) && !device()->IsTestDevice()) {
         if (snapuserd_client_) {
             snapuserd_client_->DetachSnapuserd();
+            snapuserd_client_->RemoveTransitionedDaemonIndicator();
             snapuserd_client_ = nullptr;
         }
     }
@@ -4347,6 +4348,17 @@ std::string SnapshotManager::ReadSourceBuildFingerprint() {
 
     SnapshotUpdateStatus status = ReadSnapshotUpdateStatus(lock.get());
     return status.source_build_fingerprint();
+}
+
+bool SnapshotManager::IsUserspaceSnapshotUpdateInProgress() {
+    auto slot = GetCurrentSlot();
+    if (slot == Slot::Target) {
+        if (IsSnapuserdRequired()) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 }  // namespace snapshot
