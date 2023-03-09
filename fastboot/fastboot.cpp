@@ -255,6 +255,10 @@ static void InfoMessage(const std::string& info) {
     fprintf(stderr, "(bootloader) %s\n", info.c_str());
 }
 
+static void TextMessage(const std::string& text) {
+    fprintf(stderr, "%s", text.c_str());
+}
+
 bool ReadFileToVector(const std::string& file, std::vector<char>* out) {
     out->clear();
 
@@ -338,30 +342,49 @@ struct NetworkSerial {
     int port;
 };
 
-static Result<NetworkSerial> ParseNetworkSerial(const std::string& serial) {
-    const auto serial_parsed = android::base::Tokenize(serial, ":");
-    const auto parsed_segments_count = serial_parsed.size();
-    if (parsed_segments_count != 2 && parsed_segments_count != 3) {
-        return Error() << "invalid network address: " << serial << ". Expected format:\n"
-                       << "<protocol>:<address>:<port> (tcp:localhost:5554)";
-    }
+class ParseNetworkAddressError {
+  public:
+    enum Type { WRONG_PREFIX = 1, WRONG_ADDRESS = 2 };
 
+    ParseNetworkAddressError(Type&& type) : type_(std::forward<Type>(type)) {}
+
+    Type value() const { return type_; }
+    operator Type() const { return value(); }
+    std::string print() const { return ""; }
+
+  private:
+    Type type_;
+};
+
+static Result<NetworkSerial, ParseNetworkAddressError> ParseNetworkSerial(
+        const std::string& serial) {
     Socket::Protocol protocol;
-    if (serial_parsed[0] == "tcp") {
+    const char* net_address = nullptr;
+    int port = 0;
+
+    if (android::base::StartsWith(serial, "tcp:")) {
         protocol = Socket::Protocol::kTcp;
-    } else if (serial_parsed[0] == "udp") {
+        net_address = serial.c_str() + strlen("tcp:");
+        port = tcp::kDefaultPort;
+    } else if (android::base::StartsWith(serial, "udp:")) {
         protocol = Socket::Protocol::kUdp;
+        net_address = serial.c_str() + strlen("udp:");
+        port = udp::kDefaultPort;
     } else {
-        return Error() << "invalid network address: " << serial << ". Expected format:\n"
-                       << "<protocol>:<address>:<port> (tcp:localhost:5554)";
+        return Error<ParseNetworkAddressError>(ParseNetworkAddressError::Type::WRONG_PREFIX)
+               << "protocol prefix ('tcp:' or 'udp:') is missed: " << serial << ". "
+               << "Expected address format:\n"
+               << "<protocol>:<address>:<port> (tcp:localhost:5554)";
     }
 
-    int port = 5554;
-    if (parsed_segments_count == 3) {
-        android::base::ParseInt(serial_parsed[2], &port, 5554);
+    std::string error;
+    std::string host;
+    if (!android::base::ParseNetAddress(net_address, &host, &port, nullptr, &error)) {
+        return Error<ParseNetworkAddressError>(ParseNetworkAddressError::Type::WRONG_ADDRESS)
+               << "invalid network address '" << net_address << "': " << error;
     }
 
-    return NetworkSerial{protocol, serial_parsed[1], port};
+    return NetworkSerial{protocol, host, port};
 }
 
 // Opens a new Transport connected to the particular device.
@@ -376,7 +399,8 @@ static Result<NetworkSerial> ParseNetworkSerial(const std::string& serial) {
 // object, and the caller should not attempt to delete the returned Transport.
 static Transport* open_device(const char* local_serial, bool wait_for_device = true,
                               bool announce = true) {
-    const Result<NetworkSerial> network_serial = ParseNetworkSerial(local_serial);
+    const Result<NetworkSerial, ParseNetworkAddressError> network_serial =
+            ParseNetworkSerial(local_serial);
 
     Transport* transport = nullptr;
     while (true) {
@@ -393,8 +417,12 @@ static Transport* open_device(const char* local_serial, bool wait_for_device = t
             if (transport == nullptr && announce) {
                 LOG(ERROR) << "error: " << error;
             }
-        } else {
+        } else if (network_serial.error().code() == ParseNetworkAddressError::Type::WRONG_PREFIX) {
+            // WRONG_PREFIX is special because it happens when user wants to communicate with USB
+            // device
             transport = usb_open(match_fastboot(local_serial));
+        } else {
+            Expect(network_serial);
         }
 
         if (transport != nullptr) {
@@ -409,7 +437,7 @@ static Transport* open_device(const char* local_serial, bool wait_for_device = t
             announce = false;
             LOG(ERROR) << "< waiting for " << local_serial << ">";
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 }
 
@@ -428,7 +456,7 @@ static Transport* NetworkDeviceConnected(bool print = false) {
         transport = open_device(device.c_str(), false, false);
 
         if (print) {
-            PrintDevice(device.c_str(), transport == nullptr ? "offline" : "device");
+            PrintDevice(device.c_str(), transport == nullptr ? "offline" : "fastboot");
         }
 
         if (transport != nullptr) {
@@ -472,7 +500,7 @@ static Transport* open_device() {
             announce = false;
             LOG(ERROR) << "< waiting for any device >";
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 }
 
@@ -483,7 +511,7 @@ static int Connect(int argc, char* argv[]) {
     }
 
     const char* local_serial = *argv;
-    EXPECT(ParseNetworkSerial(local_serial));
+    Expect(ParseNetworkSerial(local_serial));
 
     const Transport* transport = open_device(local_serial, false);
     if (transport == nullptr) {
@@ -502,7 +530,7 @@ static int Connect(int argc, char* argv[]) {
 }
 
 static int Disconnect(const char* local_serial) {
-    EXPECT(ParseNetworkSerial(local_serial));
+    Expect(ParseNetworkSerial(local_serial));
 
     ConnectedDevicesStorage storage;
     {
@@ -1095,7 +1123,9 @@ static bool load_buf(const char* fname, struct fastboot_buffer* buf) {
     unique_fd fd(TEMP_FAILURE_RETRY(open(fname, O_RDONLY | O_BINARY)));
 
     if (fd == -1) {
-        return false;
+        auto path = find_item_given_name(fname);
+        fd = unique_fd(TEMP_FAILURE_RETRY(open(path.c_str(), O_RDONLY | O_BINARY)));
+        if (fd == -1) return false;
     }
 
     struct stat s;
@@ -1551,7 +1581,7 @@ void reboot_to_userspace_fastboot() {
     delete old_transport;
 
     // Give the current connection time to close.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    std::this_thread::sleep_for(std::chrono::seconds(1));
 
     fb->set_transport(open_device());
 
@@ -2139,10 +2169,6 @@ int FastBootTool::Main(int argc, char* argv[]) {
     android::base::InitLogging(argv, FastbootLogger, FastbootAborter);
 
     bool wants_wipe = false;
-    bool wants_reboot = false;
-    bool wants_reboot_bootloader = false;
-    bool wants_reboot_recovery = false;
-    bool wants_reboot_fastboot = false;
     bool skip_reboot = false;
     bool wants_set_active = false;
     bool skip_secondary = false;
@@ -2305,7 +2331,9 @@ int FastBootTool::Main(int argc, char* argv[]) {
             .prolog = Status,
             .epilog = Epilog,
             .info = InfoMessage,
+            .text = TextMessage,
     };
+
     fastboot::FastBootDriver fastboot_driver(transport, driver_callbacks, false);
     fb = &fastboot_driver;
 
@@ -2329,7 +2357,7 @@ int FastBootTool::Main(int argc, char* argv[]) {
             }
         }
     }
-
+    std::unique_ptr<Task> reboot_task = nullptr;
     std::vector<std::string> args(argv, argv + argc);
     while (!args.empty()) {
         std::string command = next_arg(&args);
@@ -2381,30 +2409,19 @@ int FastBootTool::Main(int argc, char* argv[]) {
             fb->Download("signature", data);
             fb->RawCommand("signature", "installing signature");
         } else if (command == FB_CMD_REBOOT) {
-            wants_reboot = true;
-
             if (args.size() == 1) {
-                std::string what = next_arg(&args);
-                if (what == "bootloader") {
-                    wants_reboot = false;
-                    wants_reboot_bootloader = true;
-                } else if (what == "recovery") {
-                    wants_reboot = false;
-                    wants_reboot_recovery = true;
-                } else if (what == "fastboot") {
-                    wants_reboot = false;
-                    wants_reboot_fastboot = true;
-                } else {
-                    syntax_error("unknown reboot target %s", what.c_str());
-                }
+                std::string reboot_target = next_arg(&args);
+                reboot_task = std::make_unique<RebootTask>(fb, reboot_target);
+            } else {
+                reboot_task = std::make_unique<RebootTask>(fb);
             }
             if (!args.empty()) syntax_error("junk after reboot command");
         } else if (command == FB_CMD_REBOOT_BOOTLOADER) {
-            wants_reboot_bootloader = true;
+            reboot_task = std::make_unique<RebootTask>(fb, "bootloader");
         } else if (command == FB_CMD_REBOOT_RECOVERY) {
-            wants_reboot_recovery = true;
+            reboot_task = std::make_unique<RebootTask>(fb, "recovery");
         } else if (command == FB_CMD_REBOOT_FASTBOOT) {
-            wants_reboot_fastboot = true;
+            reboot_task = std::make_unique<RebootTask>(fb, "fastboot");
         } else if (command == FB_CMD_CONTINUE) {
             fb->Continue();
         } else if (command == FB_CMD_BOOT) {
@@ -2448,7 +2465,7 @@ int FastBootTool::Main(int argc, char* argv[]) {
             } else {
                 do_flashall(slot_override, skip_secondary, wants_wipe, force_flash);
             }
-            wants_reboot = true;
+            reboot_task = std::make_unique<RebootTask>(fb);
         } else if (command == "update") {
             bool slot_all = (slot_override == "all");
             if (slot_all) {
@@ -2460,7 +2477,7 @@ int FastBootTool::Main(int argc, char* argv[]) {
                 filename = next_arg(&args);
             }
             do_update(filename.c_str(), slot_override, skip_secondary || slot_all, force_flash);
-            wants_reboot = true;
+            reboot_task = std::make_unique<RebootTask>(fb);
         } else if (command == FB_CMD_SET_ACTIVE) {
             std::string slot = verify_slot(next_arg(&args), false);
             fb->SetActive(slot);
@@ -2532,7 +2549,6 @@ int FastBootTool::Main(int argc, char* argv[]) {
             syntax_error("unknown command %s", command.c_str());
         }
     }
-
     if (wants_wipe) {
         if (force_flash) {
             CancelSnapshotIfNeeded();
@@ -2551,19 +2567,9 @@ int FastBootTool::Main(int argc, char* argv[]) {
     if (wants_set_active) {
         fb->SetActive(next_active);
     }
-    if (wants_reboot && !skip_reboot) {
-        fb->Reboot();
-        fb->WaitForDisconnect();
-    } else if (wants_reboot_bootloader) {
-        fb->RebootTo("bootloader");
-        fb->WaitForDisconnect();
-    } else if (wants_reboot_recovery) {
-        fb->RebootTo("recovery");
-        fb->WaitForDisconnect();
-    } else if (wants_reboot_fastboot) {
-        reboot_to_userspace_fastboot();
+    if (reboot_task && !skip_reboot) {
+        reboot_task->Run();
     }
-
     fprintf(stderr, "Finished. Total time: %.3fs\n", (now() - start));
 
     auto* old_transport = fb->set_transport(nullptr);
