@@ -14,24 +14,22 @@
 // limitations under the License.
 //
 #include "task.h"
+#include "fastboot.h"
+#include "util.h"
 
 #include "fastboot.h"
 #include "util.h"
 
-FlashTask::FlashTask(const std::string& _slot) : slot_(_slot){};
-FlashTask::FlashTask(const std::string& _slot, bool _force_flash)
-    : slot_(_slot), force_flash_(_force_flash) {}
-FlashTask::FlashTask(const std::string& _slot, bool _force_flash, const std::string& _pname)
-    : pname_(_pname), fname_(find_item(_pname)), slot_(_slot), force_flash_(_force_flash) {
+FlashTask::FlashTask(const std::string& _slot, const std::string& _pname)
+    : pname_(_pname), fname_(find_item(_pname)), slot_(_slot) {
     if (fname_.empty()) die("cannot determine image filename for '%s'", pname_.c_str());
 }
-FlashTask::FlashTask(const std::string& _slot, bool _force_flash, const std::string& _pname,
-                     const std::string& _fname)
-    : pname_(_pname), fname_(_fname), slot_(_slot), force_flash_(_force_flash) {}
+FlashTask::FlashTask(const std::string& _slot, const std::string& _pname, const std::string& _fname)
+    : pname_(_pname), fname_(_fname), slot_(_slot) {}
 
 void FlashTask::Run() {
     auto flash = [&](const std::string& partition) {
-        if (should_flash_in_userspace(partition) && !is_userspace_fastboot() && !force_flash_) {
+        if (should_flash_in_userspace(partition) && !is_userspace_fastboot()) {
             die("The partition you are trying to flash is dynamic, and "
                 "should be flashed via fastbootd. Please run:\n"
                 "\n"
@@ -43,4 +41,28 @@ void FlashTask::Run() {
         do_flash(partition.c_str(), fname_.c_str());
     };
     do_for_partitions(pname_, slot_, flash, true);
+}
+
+RebootTask::RebootTask(FlashingPlan* _fp) : fp_(_fp){};
+RebootTask::RebootTask(FlashingPlan* _fp, const std::string& _reboot_target)
+    : reboot_target_(_reboot_target), fp_(_fp){};
+
+void RebootTask::Run() {
+    if ((reboot_target_ == "userspace" || reboot_target_ == "fastboot")) {
+        if (!is_userspace_fastboot()) {
+            reboot_to_userspace_fastboot();
+            fp_->fb->WaitForDisconnect();
+        }
+    } else if (reboot_target_ == "recovery") {
+        fp_->fb->RebootTo("recovery");
+        fp_->fb->WaitForDisconnect();
+    } else if (reboot_target_ == "bootloader") {
+        fp_->fb->RebootTo("bootloader");
+        fp_->fb->WaitForDisconnect();
+    } else if (reboot_target_ == "") {
+        fp_->fb->Reboot();
+        fp_->fb->WaitForDisconnect();
+    } else {
+        syntax_error("unknown reboot target %s", reboot_target_.c_str());
+    }
 }
