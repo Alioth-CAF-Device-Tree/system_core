@@ -1376,6 +1376,8 @@ MountAllResult fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
     int error_count = 0;
     CheckpointManager checkpoint_manager;
     char propbuf[PROPERTY_VALUE_MAX];
+    char propbuf_buid_type[PROPERTY_VALUE_MAX];
+
     bool is_ffbm = false;
     AvbUniquePtr avb_handle(nullptr);
     bool wiped = false;
@@ -1386,7 +1388,9 @@ MountAllResult fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
     }
     /**get boot mode*/
     property_get("ro.bootmode", propbuf, "");
-    if ((strncmp(propbuf, "ffbm-00", 7) == 0) || (strncmp(propbuf, "ffbm-01", 7) == 0))
+    property_get("ro.build.type", propbuf_buid_type, "");
+    if (((strncmp(propbuf, "ffbm-00", 7) == 0) || (strncmp(propbuf, "ffbm-01", 7) == 0)) &&
+       ((strncmp(propbuf_buid_type, "eng", 3) == 0) || (strncmp(propbuf_buid_type, "userdebug", 9) == 0)))
         is_ffbm = true;
 
     // Keep i int to prevent unsigned integer overflow from (i = top_idx - 1),
