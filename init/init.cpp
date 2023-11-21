@@ -936,13 +936,15 @@ static Result<void> ConnectEarlyStageSnapuserdAction(const BuiltinArguments& arg
 
 static void setQspaInitProp (std::string partName, int32_t part_value,
         bool hasMultiplePart = false, int partNumber = 0) {
+    std::string prop_name (PART_PROP_NAME);
+    prop_name.append(partName.c_str());
+    if (hasMultiplePart) {
+        prop_name.append(std::to_string(partNumber));
+    }
     if ((part_value & 1) != 0) {
-        std::string prop_name (PART_PROP_NAME);
-        prop_name.append(partName.c_str());
-        if (hasMultiplePart) {
-            prop_name.append(std::to_string(partNumber));
-        }
         SetProperty(prop_name.c_str(), "disabled");
+    } else {
+        SetProperty(prop_name.c_str(), "enabled");
     }
 }
 
