@@ -128,6 +128,17 @@ bool DeferOverlayfsMount() {
 }
 }
 
+#define PART_INFO_PATH "/sys/devices/soc0/"
+#define PART_PROP_NAME "ro.boot.vendor.qspa."
+
+std::vector<std::string> parts = {"gpu", "video", "camera", "display", "audio", "modem",
+        "wlan", "comp", "sensors", "npu", "spss", "nav", "comp1", "display1", "nsp", "eva"};
+
+struct PartInfo {
+    std::string part;
+    std::vector<int32_t> subpart_data;
+};
+
 static int property_triggers_enabled = 0;
 
 static int signal_fd = -1;
@@ -923,6 +934,56 @@ static Result<void> ConnectEarlyStageSnapuserdAction(const BuiltinArguments& arg
     return {};
 }
 
+static void setQspaInitProp (std::string partName, int32_t part_value,
+        bool hasMultiplePart = false, int partNumber = 0) {
+    std::string prop_name (PART_PROP_NAME);
+    prop_name.append(partName.c_str());
+    if (hasMultiplePart) {
+        prop_name.append(std::to_string(partNumber));
+    }
+    if ((part_value & 1) != 0) {
+        SetProperty(prop_name.c_str(), "disabled");
+    } else {
+        SetProperty(prop_name.c_str(), "enabled");
+    }
+}
+
+static int SetQspaProperties() {
+    for (size_t i = 0; i < parts.size(); i++) {
+        std::string subpart_path(PART_INFO_PATH);
+        subpart_path.append(parts[i]);
+        std::fstream fin;
+        fin.open(subpart_path, std::ios::in);
+        std::string line;
+        if (!fin) {
+            continue;
+        }
+        if (!getline(fin, line)) {
+            continue;
+        }
+        std::stringstream data(line);
+        std::string intermediate;
+        std::vector<int32_t> tokens;
+        PartInfo partinfo;
+        partinfo.part = parts[i];
+        // Tokenizing w.r.t ','
+        while (getline(data, intermediate, ',')) {
+            int32_t part_value = stoi(intermediate,0,16);
+            tokens.push_back(part_value);
+        }
+        partinfo.subpart_data = tokens;
+        int size = tokens.size();
+        if (size > 1) {
+            for (int i = 0; i < size; i++) {
+                setQspaInitProp(partinfo.part, tokens[i], true, i);
+            }
+        } else if (size == 1) {
+            setQspaInitProp(partinfo.part, tokens[0]);
+        }
+    }
+    return 0;
+}
+
 int SecondStageMain(int argc, char** argv) {
     if (REBOOT_BOOTLOADER_ON_PANIC) {
         InstallRebootSignalHandlers();
@@ -1057,6 +1118,11 @@ int SecondStageMain(int argc, char** argv) {
     }
 
     InitializeSubcontext();
+
+    std::string qspaEnabled = GetProperty("ro.boot.vendor.qspa", "");
+    if (qspaEnabled == "true") {
+        SetQspaProperties();
+    }
 
     ActionManager& am = ActionManager::GetInstance();
     ServiceList& sm = ServiceList::GetInstance();
